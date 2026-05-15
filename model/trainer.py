@@ -2,6 +2,9 @@
 model/trainer.py — Model Trainer with Early Stopping.
 
 Handles the PyTorch training loop for the TFT model.
+Saves:
+  - Best model weights  → model/checkpoints/tft_best.pt
+  - Loss history + meta → model/checkpoints/training_history.json
 """
 from __future__ import annotations
 
@@ -21,6 +24,7 @@ from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
+
 class EarlyStopping:
     def __init__(self, patience: int = 5, min_delta: float = 0.0):
         self.patience = patience
@@ -39,6 +43,7 @@ class EarlyStopping:
                 self.early_stop = True
         return self.early_stop
 
+
 class ModelTrainer:
     def __init__(
         self,
@@ -46,7 +51,7 @@ class ModelTrainer:
         batch_size: int = 64,
         val_split: float = 0.2,
         lr: float = 1e-3,
-        device: str = "cpu"
+        device: str = "cpu",
     ):
         self.device = torch.device(device)
         self.model = TemporalFusionTransformer(num_features=9, hidden_size=32).to(self.device)
@@ -71,7 +76,7 @@ class ModelTrainer:
         self.train_losses: list[float] = []
         self.val_losses:   list[float] = []
         self.best_epoch:   int = 0
-        
+
     def train(
         self,
         epochs: int = 20,
@@ -80,9 +85,10 @@ class ModelTrainer:
     ) -> dict:
         """
         Run training loop.
+
         Returns history dict with train/val losses per epoch.
         Saves:
-          - Best model weights → checkpoint_path (.pt)
+          - Best model weights → checkpoint_path  (.pt)
           - Loss history + metadata → history_path (.json)
         """
         logger.info("Starting training on %s...", self.device)
@@ -90,7 +96,7 @@ class ModelTrainer:
         start_time = time.time()
 
         for epoch in range(epochs):
-            # ── Train ────────────────────────────────────────────────────────
+            # ── Train ─────────────────────────────────────────────────────────
             self.model.train()
             train_loss = 0.0
             for x, y in self.train_loader:
@@ -103,7 +109,7 @@ class ModelTrainer:
                 train_loss += loss.item() * x.size(0)
             train_loss /= len(self.train_loader.dataset)
 
-            # ── Validation ───────────────────────────────────────────────────
+            # ── Validation ────────────────────────────────────────────────────
             self.model.eval()
             val_loss = 0.0
             with torch.no_grad():
@@ -115,7 +121,7 @@ class ModelTrainer:
             if len(self.val_loader.dataset) > 0:
                 val_loss /= len(self.val_loader.dataset)
 
-            # ── Record ───────────────────────────────────────────────────────
+            # ── Record ────────────────────────────────────────────────────────
             self.train_losses.append(round(train_loss, 6))
             self.val_losses.append(round(val_loss, 6))
 
@@ -124,46 +130,51 @@ class ModelTrainer:
                 epoch + 1, epochs, train_loss, val_loss,
             )
 
-            # ── Save best checkpoint ─────────────────────────────────────────
-            improved = val_loss <= self.early_stopping.best_loss
+            # ── Save best checkpoint ──────────────────────────────────────────
+            improved    = val_loss <= self.early_stopping.best_loss
             should_stop = self.early_stopping(val_loss)
 
             if improved:
                 torch.save(self.model.state_dict(), checkpoint_path)
                 self.best_epoch = epoch + 1
-                logger.info("  ✔ Best checkpoint saved (epoch %d, val=%.6f)", self.best_epoch, val_loss)
+                logger.info(
+                    "  ✔ Best checkpoint saved (epoch %d, val=%.6f)",
+                    self.best_epoch, val_loss,
+                )
 
             if should_stop:
                 logger.info("Early stopping triggered at epoch %d", epoch + 1)
                 break
 
-        # ── Save history JSON ────────────────────────────────────────────────
+        # ── Save history JSON ─────────────────────────────────────────────────
         elapsed = round(time.time() - start_time, 2)
         history = {
             "metadata": {
-                "trained_at": datetime.now().isoformat(),
-                "epochs_ran": len(self.train_losses),
-                "best_epoch": self.best_epoch,
-                "best_val_loss": min(self.val_losses),
-                "final_train_loss": self.train_losses[-1],
+                "trained_at":            datetime.now().isoformat(),
+                "epochs_ran":            len(self.train_losses),
+                "best_epoch":            self.best_epoch,
+                "best_val_loss":         min(self.val_losses),
+                "final_train_loss":      self.train_losses[-1],
                 "total_training_seconds": elapsed,
-                "device": str(self.device),
-                "batch_size": self.batch_size,
-                "learning_rate": self.lr,
-                "n_train_samples": len(self.train_loader.dataset),
-                "n_val_samples": len(self.val_loader.dataset),
+                "device":                str(self.device),
+                "batch_size":            self.batch_size,
+                "learning_rate":         self.lr,
+                "n_train_samples":       len(self.train_loader.dataset),
+                "n_val_samples":         len(self.val_loader.dataset),
             },
             "train_losses": self.train_losses,
             "val_losses":   self.val_losses,
         }
         with open(history_path, "w") as f:
             json.dump(history, f, indent=2)
-        logger.info("Training history saved to %s", history_path)
+
+        logger.info("Training history saved → %s", history_path)
         logger.info(
-            "Training complete — best epoch=%d  best_val=%.6f  time=%.1fs",
+            "Training complete — best_epoch=%d  best_val=%.6f  time=%.1fs",
             self.best_epoch, min(self.val_losses), elapsed,
         )
         return history
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -178,12 +189,12 @@ if __name__ == "__main__":
             history_path="model/checkpoints/training_history.json",
         )
         print("\n=== Training Summary ===")
-        print(f"  Epochs ran       : {history['metadata']['epochs_ran']}")
-        print(f"  Best epoch       : {history['metadata']['best_epoch']}")
-        print(f"  Best val loss    : {history['metadata']['best_val_loss']:.6f}")
-        print(f"  Train samples    : {history['metadata']['n_train_samples']}")
-        print(f"  Val samples      : {history['metadata']['n_val_samples']}")
-        print(f"  Total time (s)   : {history['metadata']['total_training_seconds']}")
+        print(f"  Epochs ran    : {history['metadata']['epochs_ran']}")
+        print(f"  Best epoch    : {history['metadata']['best_epoch']}")
+        print(f"  Best val loss : {history['metadata']['best_val_loss']:.6f}")
+        print(f"  Train samples : {history['metadata']['n_train_samples']:,}")
+        print(f"  Val samples   : {history['metadata']['n_val_samples']:,}")
+        print(f"  Time (s)      : {history['metadata']['total_training_seconds']}")
     except Exception as e:
         logger.error("Training failed: %s", e)
         raise
