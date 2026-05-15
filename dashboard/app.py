@@ -163,7 +163,7 @@ df_metrics = pd.DataFrame([
 
 colA, colB = st.columns([1, 2])
 with colA:
-    st.dataframe(df_metrics, hide_index=True, use_container_width=True)
+    st.dataframe(df_metrics, hide_index=True, width='stretch')
 
 with colB:
     # Bar chart of VaR 99%
