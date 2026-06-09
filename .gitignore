@@ -26,3 +26,8 @@ data/raw/
 .vscode/
 *.swp
 .DS_Store
+
+# Ignored artifacts
+mlflow_store/
+*.log
+check_model_out.py

@@ -113,8 +113,28 @@ class KafkaMarketProducer:
         Download 1-minute OHLCV for all tickers and return a flat list
         of MarketTick objects sorted ascending by timestamp.
         """
+        lookback_to_try = self.lookback_days
+        all_ticks = self._download_ticks_for_period(lookback_to_try)
+
+        if not all_ticks and lookback_to_try > 7:
+            logger.warning(
+                "⚠️  Failed to fetch %d days of 1-minute data from yfinance (limitations or network). "
+                "Falling back to 7 days...",
+                lookback_to_try,
+            )
+            lookback_to_try = 7
+            all_ticks = self._download_ticks_for_period(lookback_to_try)
+
+        if not all_ticks:
+            raise RuntimeError("No ticks fetched — check tickers and internet access")
+
+        all_ticks.sort(key=lambda t: t.timestamp)
+        return all_ticks
+
+    def _download_ticks_for_period(self, days: int) -> List[MarketTick]:
+        """Download ticks for a specific period in days."""
         all_ticks: List[MarketTick] = []
-        period = f"{self.lookback_days}d"
+        period = f"{days}d"
 
         for symbol in self.tickers:
             try:
@@ -126,7 +146,7 @@ class KafkaMarketProducer:
                     auto_adjust=True,
                 )
                 if df.empty:
-                    logger.warning("⚠️  No data returned for %s", symbol)
+                    logger.warning("⚠️  No data returned for %s with period %s", symbol, period)
                     continue
 
                 # Flatten MultiIndex columns if present
@@ -164,16 +184,13 @@ class KafkaMarketProducer:
                     except Exception as exc:
                         logger.debug("Skipping malformed row %s/%s: %s", symbol, ts, exc)
 
-                logger.info("  ✔ %s: %d ticks loaded", symbol, len(df))
+                logger.info("  ✔ %s: %d ticks loaded with period %s", symbol, len(df), period)
 
             except Exception as exc:
-                logger.error("Failed to fetch %s: %s", symbol, exc)
+                logger.error("Failed to fetch %s with period %s: %s", symbol, period, exc)
 
-        if not all_ticks:
-            raise RuntimeError("No ticks fetched — check tickers and internet access")
-
-        all_ticks.sort(key=lambda t: t.timestamp)
         return all_ticks
+
 
     def _publish(self, tick: MarketTick) -> None:
         """

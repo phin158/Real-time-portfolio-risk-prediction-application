@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
     consumer = KafkaMarketConsumer(
         topic=cfg.kafka_topic_market_data,
         bootstrap_servers=cfg.kafka_bootstrap_servers,
-        group_id="fastapi_backend_group",
+        group_id=cfg.kafka_group_id,
         on_valid_tick=risk_service.process_tick
     )
     

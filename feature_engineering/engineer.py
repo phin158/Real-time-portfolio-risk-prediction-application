@@ -1,11 +1,11 @@
 """
 feature_engineering/engineer.py — FeatureEngineer class.
 
-Maintains a per-symbol rolling price buffer and computes a 9-feature
+Maintains a per-symbol rolling price buffer and computes a 12-feature
 vector on every incoming ValidatedTick.  Outputs both per-symbol
 DataFrames and a unified portfolio tensor for TFT model input.
 
-Feature set (N_FEATURES = 9, per symbol per timestep):
+Feature set (N_FEATURES = 12, per symbol per timestep):
   [0] log_return        — ln(close_t / close_{t-1})
   [1] vol_30            — annualised vol over last 30 bars
   [2] vol_60            — annualised vol over last 60 bars
@@ -15,6 +15,9 @@ Feature set (N_FEATURES = 9, per symbol per timestep):
   [6] macd_signal       — EMA(9) of MACD line
   [7] macd_hist         — macd_line - macd_signal
   [8] zscore_30         — rolling z-score of close over 30 bars
+  [9] volume_change     — rate of change of volume
+  [10] volume_zscore_30 — rolling z-score of volume over 30 bars
+  [11] dollar_volume    — close × volume proxy for liquidity
 
 Design:
   - Rolling deques are capped at MAX_WINDOW to bound memory.
@@ -42,14 +45,18 @@ from feature_engineering.indicators import (
     rolling_volatility,
     rolling_zscore,
     rsi,
+    volume_change,
+    volume_zscore,
+    dollar_volume,
 )
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-N_FEATURES: int = 9
+N_FEATURES: int = 12
 FEATURE_NAMES: List[str] = [
+    # Original 9 features
     "log_return",
     "vol_30",
     "vol_60",
@@ -59,10 +66,27 @@ FEATURE_NAMES: List[str] = [
     "macd_signal",
     "macd_hist",
     "zscore_30",
+    # New volume-based features (Phase 5)
+    "volume_change",      # rate of change of volume
+    "volume_zscore_30",   # rolling z-score of volume over 30 bars
+    "dollar_volume",      # close × volume proxy for liquidity
 ]
-MIN_HISTORY: int = 30       # Minimum ticks before features are computed
-MAX_WINDOW: int = 420       # Max price buffer per symbol (covers vol_390 + slack)
-HISTORY_CAP: int = 1_000    # Max feature records kept per symbol
+# ── Warm-up Constants ────────────────────────────────────────────────────────
+#
+# MIN_HISTORY_BASIC: Minimum ticks before model inference is allowed.
+#   - Model lookback = 60 bars → we need at least 60 bars of features.
+#   - Old value (30) was too low: it would send under-length tensors to TFT.
+#
+# MIN_HISTORY_FULL: Minimum ticks for stable covariance estimation.
+#   - vol_390 feature requires 390 price bars (≈ 1 trading day).
+#   - Covariance matrix estimation also requires ≥ 390 bars for stability.
+#   - Below this threshold, risk estimates are marked reliable=False.
+#
+MIN_HISTORY: int = 60        # Backward-compatible alias for MIN_HISTORY_BASIC
+MIN_HISTORY_BASIC: int = 60  # Minimum for model inference (lookback = 60)
+MIN_HISTORY_FULL: int = 390  # Minimum for stable covariance estimation
+MAX_WINDOW: int = 420        # Max price buffer per symbol (covers vol_390 + slack)
+HISTORY_CAP: int = 1_000     # Max feature records kept per symbol
 
 
 # ── FeatureRecord ─────────────────────────────────────────────────────────────
@@ -84,10 +108,14 @@ class FeatureRecord:
     macd_signal: float
     macd_hist: float
     zscore_30: float
+    # Volume-based features added in Phase 5
+    volume_change: float = 0.0
+    volume_zscore_30: float = 0.0
+    dollar_volume: float = 0.0
 
     def to_array(self) -> np.ndarray:
         """
-        Return the 9 numeric features as a float32 numpy array.
+        Return the 12 numeric features as a float32 numpy array.
         NaN values are preserved for downstream imputation.
         """
         return np.array(
@@ -101,6 +129,9 @@ class FeatureRecord:
                 self.macd_signal,
                 self.macd_hist,
                 self.zscore_30,
+                self.volume_change,
+                self.volume_zscore_30,
+                self.dollar_volume,
             ],
             dtype=np.float32,
         )
@@ -145,20 +176,25 @@ class FeatureEngineer:
         self.ann_factor = ann_factor
 
         # Per-symbol rolling price buffers
-        self._prices: Dict[str, deque[float]] = {
+        self._prices: Dict[str, deque] = {
+            s: deque(maxlen=max_window) for s in self.symbols
+        }
+        # Per-symbol rolling volume buffers (for volume_change, volume_zscore)
+        self._volumes: Dict[str, deque] = {
             s: deque(maxlen=max_window) for s in self.symbols
         }
         # Per-symbol feature history
-        self._history: Dict[str, deque[FeatureRecord]] = {
+        self._history: Dict[str, deque] = {
             s: deque(maxlen=history_cap) for s in self.symbols
         }
         # Count of ticks processed per symbol (for logging)
         self._tick_count: Dict[str, int] = {s: 0 for s in self.symbols}
 
         logger.info(
-            "FeatureEngineer initialised — symbols=%s  min_history=%d",
+            "FeatureEngineer initialised — symbols=%s  min_history=%d  n_features=%d",
             self.symbols,
             self.min_history,
+            N_FEATURES,
         )
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -177,19 +213,22 @@ class FeatureEngineer:
         if symbol not in self._prices:
             logger.debug("Unknown symbol %s — registering dynamically", symbol)
             self._prices[symbol] = deque(maxlen=self.max_window)
+            self._volumes[symbol] = deque(maxlen=self.max_window)
             self._history[symbol] = deque(maxlen=self.history_cap)
             self._tick_count[symbol] = 0
             if symbol not in self.symbols:
                 self.symbols.append(symbol)
 
         self._prices[symbol].append(tick.close)
+        self._volumes[symbol].append(float(tick.volume) if tick.volume else 0.0)
         self._tick_count[symbol] += 1
 
         prices_arr = np.array(self._prices[symbol], dtype=np.float64)
         if len(prices_arr) < self.min_history:
             return None
 
-        record = self._compute_features(symbol, tick.timestamp, prices_arr)
+        volumes_arr = np.array(self._volumes[symbol], dtype=np.float64)
+        record = self._compute_features(symbol, tick.timestamp, prices_arr, volumes_arr)
         self._history[symbol].append(record)
 
         logger.debug(
@@ -257,9 +296,86 @@ class FeatureEngineer:
 
         return tensor
 
+    def get_returns_matrix(
+        self,
+        symbols: Optional[List[str]] = None,
+        window: int = 390,
+    ) -> Tuple[np.ndarray, List[str]]:
+        """
+        Build an aligned returns matrix for portfolio risk computation.
+
+        Returns a 2-D array (T, N) where T = window, N = number of symbols.
+        Only symbols with at least `window` returns are included.
+        Columns are aligned: same time index across all symbols.
+
+        This is the PRIMARY input for covariance-based portfolio VaR.
+        Do NOT use get_correlation_matrix() as a substitute for this.
+
+        Args:
+            symbols: Which symbols to include. Defaults to self.symbols.
+            window:  Number of most-recent returns to use.
+
+        Returns:
+            Tuple of (returns_matrix shape (T, N), included_symbols).
+            T may be < window if some symbols have fewer returns.
+        """
+        target_symbols = [s.upper() for s in (symbols or self.symbols)]
+        col_data: Dict[str, np.ndarray] = {}
+
+        for sym in target_symbols:
+            prices_arr = np.array(self._prices.get(sym, []), dtype=np.float64)
+            if len(prices_arr) >= 2:
+                rets = log_return(prices_arr)
+                col_data[sym] = rets[-window:]
+
+        if len(col_data) < 1:
+            return np.empty((0, 0), dtype=np.float64), []
+
+        # Stack into matrix — shape (T, N)
+        included = list(col_data.keys())
+        min_len = min(len(v) for v in col_data.values())
+        matrix = np.column_stack([col_data[s][-min_len:] for s in included])
+
+        return matrix.astype(np.float64), included
+
+    def get_covariance_matrix(
+        self,
+        symbols: Optional[List[str]] = None,
+        window: int = 390,
+    ) -> Tuple[np.ndarray, List[str]]:
+        """
+        Compute rolling covariance matrix of asset log returns.
+
+        This uses the CORRECT formula for portfolio volatility:
+            σ²_p = w.T @ Σ @ w
+
+        Do NOT use correlation matrix as a substitute.
+
+        Args:
+            symbols: Which symbols to include.
+            window:  Number of most-recent return bars.
+
+        Returns:
+            Tuple of (covariance_matrix shape (N, N), included_symbols).
+        """
+        matrix, included = self.get_returns_matrix(symbols, window)
+        if matrix.size == 0:
+            return np.empty((0, 0)), []
+
+        # ddof=1 for unbiased sample covariance
+        cov = np.cov(matrix.T, ddof=1)
+        if cov.ndim == 0:
+            cov = np.array([[float(cov)]])
+
+        return cov, included
+
     def get_correlation_matrix(self, window: int = 60) -> pd.DataFrame:
         """
         Compute the rolling correlation matrix across all symbols.
+
+        NOTE: Use get_covariance_matrix() for portfolio VaR computation.
+        This method returns correlation (not covariance) — useful for
+        display and explanation, but NOT for portfolio volatility formula.
 
         Args:
             window: Number of log-return bars to include.
@@ -275,6 +391,40 @@ class FeatureEngineer:
                 returns_dict[sym] = log_return(prices_arr)
 
         return correlation_matrix(returns_dict, window=window)
+
+    def get_history_status(self, symbol: str) -> Dict:
+        """
+        Return warm-up status for a symbol.
+
+        Returns:
+            Dict with tick_count, basic_ready (>=60), full_ready (>=390),
+            reliable flag, and a warning message if data is insufficient.
+        """
+        sym = symbol.upper()
+        count = self._tick_count.get(sym, 0)
+        basic_ready = count >= 60
+        full_ready = count >= 390
+
+        warning = None
+        if not basic_ready:
+            warning = (
+                f"Insufficient history for model inference: "
+                f"{count}/60 bars available for {sym}."
+            )
+        elif not full_ready:
+            warning = (
+                f"Insufficient history for stable covariance estimation: "
+                f"{count}/390 bars available for {sym}. Results are provisional."
+            )
+
+        return {
+            "symbol": sym,
+            "tick_count": count,
+            "basic_ready": basic_ready,
+            "full_ready": full_ready,
+            "reliable": full_ready,
+            "warning": warning,
+        }
 
     def get_ready_symbols(self) -> List[str]:
         """Return symbols that have completed their warm-up period."""
@@ -294,27 +444,34 @@ class FeatureEngineer:
         symbol: str,
         timestamp: datetime,
         prices_arr: np.ndarray,
+        volumes_arr: np.ndarray,
     ) -> FeatureRecord:
         """
-        Compute all 9 features from a price buffer array.
+        Compute all 12 features from a price + volume buffer array.
 
         Args:
-            symbol:     Ticker symbol.
-            timestamp:  Timestamp of the latest bar.
-            prices_arr: Array of close prices, latest last.
+            symbol:      Ticker symbol.
+            timestamp:   Timestamp of the latest bar.
+            prices_arr:  Array of close prices, latest last.
+            volumes_arr: Array of volumes, same length as prices_arr.
 
         Returns:
-            FeatureRecord with all computed feature values.
+            FeatureRecord with all 12 computed feature values.
         """
         rets = log_return(prices_arr)
 
-        lr = float(rets[-1]) if len(rets) > 0 else np.nan
-        v30 = rolling_volatility(rets, window=30, ann_factor=self.ann_factor)
-        v60 = rolling_volatility(rets, window=60, ann_factor=self.ann_factor)
-        v390 = rolling_volatility(rets, window=390, ann_factor=self.ann_factor)
+        lr    = float(rets[-1]) if len(rets) > 0 else np.nan
+        v30   = rolling_volatility(rets, window=30, ann_factor=self.ann_factor)
+        v60   = rolling_volatility(rets, window=60, ann_factor=self.ann_factor)
+        v390  = rolling_volatility(rets, window=390, ann_factor=self.ann_factor)
         rsi_val = rsi(prices_arr)
         ml, sl, mh = macd(prices_arr)
-        zs = rolling_zscore(prices_arr, window=30)
+        zs    = rolling_zscore(prices_arr, window=30)
+
+        # Volume-based features (Phase 5)
+        vc    = volume_change(volumes_arr)
+        vz    = volume_zscore(volumes_arr, window=30)
+        dv    = dollar_volume(prices_arr, volumes_arr)
 
         return FeatureRecord(
             timestamp=timestamp,
@@ -328,6 +485,9 @@ class FeatureEngineer:
             macd_signal=sl,
             macd_hist=mh,
             zscore_30=zs,
+            volume_change=vc,
+            volume_zscore_30=vz,
+            dollar_volume=dv,
         )
 
 

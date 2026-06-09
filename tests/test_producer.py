@@ -138,6 +138,26 @@ class TestFetchSortedTicks:
             with pytest.raises(RuntimeError, match="No ticks fetched"):
                 mock_producer._fetch_sorted_ticks()
 
+    def test_fallback_to_7_days(self, mock_producer: KafkaMarketProducer) -> None:
+        """If lookback_days = 30 and yf.download returns empty, it must fallback to 7 days."""
+        mock_producer.lookback_days = 30
+        mock_producer.tickers = ["AAPL"]
+        df_7d = _make_ohlcv_df("AAPL", n_rows=2)
+
+        with patch("data_pipeline.producer.yf.download") as mock_dl:
+            # First download (30d) returns empty df, second (7d) returns valid df
+            mock_dl.side_effect = [pd.DataFrame(), df_7d]
+            ticks = mock_producer._fetch_sorted_ticks()
+
+        assert len(ticks) == 2
+        # Check that download was called twice: first with 30d, then with 7d
+        assert mock_dl.call_count == 2
+        first_call_kwargs = mock_dl.call_args_list[0].kwargs
+        second_call_kwargs = mock_dl.call_args_list[1].kwargs
+        assert first_call_kwargs["period"] == "30d"
+        assert second_call_kwargs["period"] == "7d"
+
+
 
 # ── Kafka publish ─────────────────────────────────────────────────────────────
 

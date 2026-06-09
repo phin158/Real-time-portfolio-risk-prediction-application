@@ -17,15 +17,19 @@ logger = logging.getLogger(__name__)
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     cfg = get_settings()
-    
+
     # Async Redis client for the ASGI loop
     redis_client = redis.Redis.from_url(cfg.redis_url, decode_responses=True)
     pubsub = redis_client.pubsub()
-    
+
     try:
-        await pubsub.subscribe("portfolio_risk_stream")
-        logger.info("WebSocket client connected and subscribed to Redis")
-        
+        # Use cfg.redis_channel — not hardcoded — for consistency with RiskService
+        await pubsub.subscribe(cfg.redis_channel)
+        logger.info(
+            "WebSocket client connected and subscribed to Redis channel '%s'",
+            cfg.redis_channel,
+        )
+
         while True:
             # Check for disconnects by pinging client
             # But get_message blocks, so we use timeout and sleep
@@ -35,11 +39,11 @@ async def websocket_endpoint(websocket: WebSocket):
             else:
                 # Small sleep to yield to event loop
                 await asyncio.sleep(0.01)
-                
+
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
     except Exception as e:
         logger.error("WebSocket error: %s", e)
     finally:
-        await pubsub.unsubscribe("portfolio_risk_stream")
+        await pubsub.unsubscribe(cfg.redis_channel)
         await redis_client.aclose()

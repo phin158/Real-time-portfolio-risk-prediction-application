@@ -85,8 +85,8 @@ class TemporalFusionTransformer(nn.Module):
     """
     def __init__(
         self,
-        num_features: int = 9,
-        hidden_size: int = 32,
+        num_features: int = 12,
+        hidden_size: int = 64,
         lstm_layers: int = 2,
         num_heads: int = 4,
         dropout: float = 0.1
@@ -143,29 +143,76 @@ def quantile_loss(preds: torch.Tensor, target: torch.Tensor, quantiles: list[flo
         losses.append(loss)
     return torch.stack(losses, dim=1).mean()
 
-def tft_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+def tft_loss(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    lambda_quantile: float = 1.0,
+    lambda_volatility: float = 0.1,
+) -> torch.Tensor:
     """
     Combined loss: Quantile loss for returns + MSE for volatility.
-    preds: (batch, 4) -> [Q0.01, Q0.05, Q0.50, Volatility]
-    targets: (batch, 2) -> [target_return, target_volatility]
+
+    IMPORTANT: Quantile loss on returns and MSE on volatility have DIFFERENT scales.
+    Using 1:1 weighting (the old approach) is not justified.
+    The default LAMBDA_VOLATILITY=0.1 is a reasonable starting point — tune as needed.
+
+    Formula:
+        total_loss = lambda_quantile * quantile_loss + lambda_volatility * vol_loss
+
+    Args:
+        preds:             (batch, 4) — [Q0.01, Q0.05, Q0.50, Volatility]
+        targets:           (batch, 2) — [target_return, target_volatility]
+        lambda_quantile:   Weight for quantile loss component (default 1.0).
+        lambda_volatility: Weight for volatility MSE loss (default 0.1).
+
+    Returns:
+        Scalar total loss tensor.
     """
-    # Returns (VaR)
+    # Returns (VaR quantile loss)
     target_returns = targets[:, 0]
     q_loss = quantile_loss(preds[:, :3], target_returns, quantiles=[0.01, 0.05, 0.50])
-    
+
     # Volatility (MSE)
     target_vols = targets[:, 1]
     vol_loss = F.mse_loss(preds[:, 3], target_vols)
-    
-    # Combined (scale vol_loss to match magnitude if needed, but 1:1 is fine for now)
-    return q_loss + vol_loss
+
+    # Weighted combination
+    total = lambda_quantile * q_loss + lambda_volatility * vol_loss
+    return total
+
+
+def tft_loss_components(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    lambda_quantile: float = 1.0,
+    lambda_volatility: float = 0.1,
+) -> dict:
+    """
+    Same as tft_loss but returns individual components for logging.
+
+    Returns:
+        Dict with: total_loss, quantile_loss, volatility_loss (all tensors).
+    """
+    target_returns = targets[:, 0]
+    q_loss = quantile_loss(preds[:, :3], target_returns, quantiles=[0.01, 0.05, 0.50])
+
+    target_vols = targets[:, 1]
+    vol_loss = F.mse_loss(preds[:, 3], target_vols)
+
+    total = lambda_quantile * q_loss + lambda_volatility * vol_loss
+    return {
+        "total_loss": total,
+        "quantile_loss": q_loss,
+        "volatility_loss": vol_loss,
+    }
 
 if __name__ == "__main__":
-    model = TemporalFusionTransformer(num_features=9, hidden_size=32)
-    x = torch.randn(16, 60, 9) # (batch_size, seq_len, num_features)
+    model = TemporalFusionTransformer(num_features=12, hidden_size=64)
+    x = torch.randn(16, 60, 12)  # (batch_size, seq_len, num_features)
     out = model(x)
-    print(f"Model output shape: {out.shape}") # Expected: (16, 4)
-    
-    targets = torch.randn(16, 2) # [return, vol]
+    print(f"Model output shape: {out.shape}")  # Expected: (16, 4)
+    print(f"  hidden_size=64, num_features=12 ✅")
+
+    targets = torch.randn(16, 2)  # [return, vol]
     loss = tft_loss(out, targets)
     print(f"Loss: {loss.item():.4f}")

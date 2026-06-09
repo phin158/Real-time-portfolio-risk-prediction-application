@@ -230,6 +230,85 @@ def correlation_matrix(
     return pd.DataFrame(data).corr(method="pearson")
 
 
+# ── Volume-Based Features ─────────────────────────────────────────────────────
+
+def volume_change(volumes: np.ndarray) -> float:
+    """
+    Compute rate of change of the most recent volume bar relative to
+    the previous bar.
+
+    Formula:
+        volume_change = (V_t - V_{t-1}) / V_{t-1}
+
+    Args:
+        volumes: 1-D array of volume values, at least length 2.
+
+    Returns:
+        Relative volume change in [-inf, +inf], or 0.0 if insufficient data.
+    """
+    if len(volumes) < 2:
+        return 0.0
+    v_prev = float(volumes[-2])
+    v_curr = float(volumes[-1])
+    if v_prev == 0.0:
+        return 0.0
+    change = (v_curr - v_prev) / v_prev
+    return float(change) if np.isfinite(change) else 0.0
+
+
+def volume_zscore(volumes: np.ndarray, window: int = 30) -> float:
+    """
+    Compute rolling z-score of volume over the last `window` bars.
+
+    Formula:
+        mu  = mean(volumes[-window:])
+        std = std(volumes[-window:])
+        zscore = (V_t - mu) / std
+
+    A high positive z-score indicates unusually high volume (possible breakout).
+    A low negative z-score indicates unusually low volume.
+
+    Args:
+        volumes: 1-D array of volume values.
+        window:  Look-back window (default 30).
+
+    Returns:
+        Z-score of the latest volume bar, or 0.0 if insufficient data.
+    """
+    if len(volumes) < window:
+        return 0.0
+    window_vols = volumes[-window:]
+    mu  = float(np.mean(window_vols))
+    std = float(np.std(window_vols, ddof=1))
+    if std == 0.0 or not np.isfinite(std):
+        return 0.0
+    z = (float(volumes[-1]) - mu) / std
+    return float(z) if np.isfinite(z) else 0.0
+
+
+def dollar_volume(closes: np.ndarray, volumes: np.ndarray) -> float:
+    """
+    Compute rolling dollar volume (close × volume) for the latest bar.
+
+    Dollar volume is a proxy for market liquidity and institutional activity.
+    High dollar volume with price movement typically signals stronger conviction.
+
+    Formula:
+        dollar_volume_t = close_t × volume_t
+
+    Args:
+        closes:  1-D array of close prices (same length as volumes).
+        volumes: 1-D array of trade volumes.
+
+    Returns:
+        Dollar volume for the latest bar, or 0.0 if insufficient data.
+    """
+    if len(closes) == 0 or len(volumes) == 0:
+        return 0.0
+    dv = float(closes[-1]) * float(volumes[-1])
+    return float(dv) if np.isfinite(dv) else 0.0
+
+
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -280,5 +359,17 @@ if __name__ == "__main__":
     assert all(np.isnan(v) for v in (ml2, sl2, h2)), "Expected nan for short series"
     print("  ✅ NaN guard   — all short-series checks pass")
 
+    # volume indicators
+    vols_arr = rng.uniform(1e5, 5e5, 50)
+    cl_arr   = prices[1:51]
+    vc = volume_change(vols_arr)
+    assert np.isfinite(vc), f"volume_change not finite: {vc}"
+    vz = volume_zscore(vols_arr, window=30)
+    assert np.isfinite(vz), f"volume_zscore not finite: {vz}"
+    dv = dollar_volume(cl_arr, vols_arr)
+    assert dv > 0, f"dollar_volume must be positive: {dv}"
+    print(f"  ✅ volume_change={vc:.4f}  volume_zscore={vz:.4f}  dollar_volume={dv:.0f}")
+
     print("\n✅ All indicators.py tests passed.")
     sys.exit(0)
+
